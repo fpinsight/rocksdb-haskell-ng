@@ -349,6 +349,8 @@ mget dbh readOpts keys =
                                                    errors <- peekArray numKeys errorsArray
                                                    errorsBS <- mapM (\cs -> unsafePackCStringWithFinalizer cs c_rocksdb_free_ptr) errors
                                                    valuesBS <- mapM (\csl -> unsafePackCStringLenWithFinalizer csl c_rocksdb_free_ptr) (zip vals vsizes)
+                                                   let toto = map (\(a, b) -> if a /= S.empty then Left a else Right b) (zip errorsBS valuesBS)
+                                                   print toto
                                                    -- should return either e value
                                                    return $ map (\v -> if v == S.empty then Nothing else Just v) valuesBS
                                                  )
@@ -361,7 +363,6 @@ mget dbh readOpts keys =
             )
        )
     )
-
 
 unsafePackCStringWithFinalizer :: CString -> FinalizerPtr Word8 -> IO ByteString
 unsafePackCStringWithFinalizer cstr f
@@ -378,12 +379,6 @@ unsafePackCStringLenWithFinalizer (p, l) f
       fptr <- newForeignPtr f (castPtr p)
       return $! PS fptr 0 (fromIntegral l)
 
-getMaybeByteString :: (Ptr Word8, Int) -> IO (Maybe ByteString)
-getMaybeByteString (p, l) = do
-  fptr <- newForeignPtr c_rocksdb_free_ptr p
-  let !bs = PS fptr 0 (fromIntegral l)
-  return $! Just bs
-
 unsafeUseAsCStringLenList :: [ByteString] -> ([CStringLen] -> IO a) -> IO a
 unsafeUseAsCStringLenList bss f =
   -- need to get the list of foreign pointers to touch them
@@ -395,8 +390,6 @@ unsafeUseAsCStringLenList bss f =
   where
     toCStringLen :: ByteString -> (ForeignPtr Word8, CStringLen)
     toCStringLen (PS ps s l) = (ps, ((unsafeForeignPtrToPtr ps) `plusPtr` s, l))
-     -- toCStringLen (PS ps s l) = (ps, ((castPtr (unsafeForeignPtrToPtr ps)) `plusPtr` s, l))
-
 
 -- | Write a batch of operations atomically.
 write :: MonadIO m => DB -> WriteOptions -> [BatchOp] -> m ()
