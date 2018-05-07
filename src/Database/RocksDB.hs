@@ -8,8 +8,8 @@
 -- | A safe binding to RocksDB.
 
 module Database.RocksDB
-    -- * Basic Functions
-  ( open
+  ( -- * Basic functions
+    open
   , defaultOptions
   , Options(..)
   , DB
@@ -32,6 +32,9 @@ module Database.RocksDB
   , iterEntry
   , iterNext
   , Iterator
+  -- * Snapshots
+  , createSnapshot
+  , releaseSnapshot
   -- * Misc types
   , RocksDBException(..)
   -- * Utilities
@@ -69,15 +72,20 @@ data Options = Options
   , optionsCompression :: !Compression
   }
 
+-- | Data compression mode.
 data Compression
   = NoCompression
   | SnappyCompression
   | ZlibCompression
   deriving (Enum, Bounded, Show)
 
+-- | Options for writing data to the database.
 data WriteOptions = WriteOptions {}
 
-data ReadOptions = ReadOptions {}
+-- | Options for reading data to the database.
+data ReadOptions = ReadOptions
+  { readOptionsSnapshot :: Maybe Snapshot
+  }
 
 -- | Batch operation
 data BatchOp
@@ -96,7 +104,7 @@ data Iterator = Iterator
   { iteratorDB :: !DB
   , iteratorRef :: !(IORef (Maybe (Ptr CIterator)))
     -- ^ This field is not protected; operations in an Iterator get a
-    -- lock on the @DB@ with 'withDBPtr', making access to this
+    -- lock on the @DB@ with @withDBPtr@, making access to this
     -- safe. Without a database pointer, an iterator pointer is freed
     -- and no longer useful.
     --
@@ -105,12 +113,22 @@ data Iterator = Iterator
     -- to "release" an iterator, anyway.
   }
 
+-- | A handle to a RocksDB snapshot. When handle becomes out of reach,
+-- the snapshot is destroyed.
+data Snapshot = Snapshot
+  { snapshotDB :: !DB
+    -- ^ We keep a reference to the DB for liveness purposes.
+  , snapshotRef :: !(IORef (Maybe (Ptr CSnapshot)))
+    -- ^ This field is not protected by an MVar. The snapshot is accessed
+  }
+
 -- | An exception thrown by this module.
 data RocksDBException
   = UnsuccessfulOperation !String !String
   | AllocationReturnedNull !String
   | DatabaseIsClosed !String
   | IteratorIsClosed !String
+  | SnapshotIsClosed !String
   | IteratorIsInvalid !String
   deriving (Typeable, Show, Eq)
 instance Exception RocksDBException
@@ -118,6 +136,7 @@ instance Exception RocksDBException
 --------------------------------------------------------------------------------
 -- Defaults
 
+-- | Default connection options.
 defaultOptions :: FilePath -> Options
 defaultOptions fp =
   Options
@@ -126,11 +145,13 @@ defaultOptions fp =
   , optionsCompression = NoCompression
   }
 
+-- | Default writing options.
 defaultWriteOptions :: WriteOptions
 defaultWriteOptions = WriteOptions {}
 
+-- | Default reading options.
 defaultReadOptions :: ReadOptions
-defaultReadOptions = ReadOptions {}
+defaultReadOptions = ReadOptions {readOptionsSnapshot = Nothing}
 
 --------------------------------------------------------------------------------
 -- Publicly-exposed functions
@@ -195,17 +216,12 @@ open config =
 close :: MonadIO m => DB -> m ()
 close dbh =
   liftIO
-    (modifyMVar_
-       (dbVar dbh)
-       (\mfptr -> do
-          maybe (evaluate ()) finalizeForeignPtr mfptr
-          -- Previous line: The fptr would be finalized _eventually_, so
-          -- no memory leaks. But calling @close@ indicates you want to
-          -- release the resources right now.
-          --
-          -- Also, a foreign pointer's finalizer is ran and then deleted,
-          -- so you can't double-free.
-          pure Nothing))
+    (do mfptr <- modifyMVar (dbVar dbh) (pure . (Nothing, ))
+        -- If an async exception comes after here, that's a pity
+        -- because we wanted to free the file now. But with regards to
+        -- safety, the finalizers will take care of closing
+        -- eventually.
+        maybe (evaluate ()) finalizeForeignPtr mfptr)
 
 -- | Delete value at @key@.
 delete :: MonadIO m => DB -> WriteOptions -> ByteString -> m ()
@@ -270,6 +286,7 @@ get dbh readOpts key =
                alloca
                  (\vlen_ptr ->
                     withReadOptions
+                      dbPtr
                       readOpts
                       (\optsPtr ->
                          uninterruptibleMask_
@@ -429,8 +446,45 @@ write dbh opts batch =
       touchForeignPtr p'
     touch (Del (PS p _ _)) = touchForeignPtr p
 
--- | Create an iterator on the DB. If the DB is closed the iterator's functions
---  will throw an exception.
+-- | Create an snapshot on the DB. If the DB is later closed the
+--  snapshot's functions will throw an exception.
+createSnapshot :: MonadIO m => DB -> m Snapshot
+createSnapshot db =
+  liftIO
+    (withDBPtr
+       db
+       "createSnapshot"
+       (\dbPtr -> do
+          snapshotPtr <-
+            assertNotNull
+              "c_rocksdb_create_snapshot"
+              (c_rocksdb_create_snapshot dbPtr)
+          var <- newIORef (Just snapshotPtr)
+          pure (Snapshot {snapshotDB = db, snapshotRef = var})))
+
+-- | Destroy an snapshot.
+--
+-- * Calling this function twice has no ill-effects.
+--
+-- * You don't have to call this; if you no longer hold a reference to
+--   the @Snapshot@ then it will be closed upon garbage collection. But you
+--   can call this function to do it early.
+--
+-- * Further operations will throw an exception on a closed @Snapshot@.
+releaseSnapshot :: MonadIO m => Snapshot -> m ()
+releaseSnapshot snapshot =
+  liftIO
+    (withDBPtr
+       (snapshotDB snapshot)
+       "releaseSnapshot"
+       (\dbPtr ->
+          liftIO
+            (uninterruptibleMask_
+               (do mptr <- atomicModifyIORef' (snapshotRef snapshot) (Nothing, )
+                   maybe (pure ()) (c_rocksdb_release_snapshot dbPtr) mptr))))
+
+-- | Create an iterator on the DB. If the DB is later closed the
+--  iterator's functions will throw an exception.
 createIter :: MonadIO m => DB -> ReadOptions -> m Iterator
 createIter db opts =
   liftIO
@@ -439,6 +493,7 @@ createIter db opts =
        "createIter"
        (\dbPtr ->
           withReadOptions
+            dbPtr
             opts
             (\readOpts -> do
                iterPtr <-
@@ -470,7 +525,12 @@ releaseIter iterator =
                       atomicModifyIORef' (iteratorRef iterator) (Nothing, )
                     maybe (pure ()) c_rocksdb_iter_destroy mptr)))))
 
-iterSeek :: MonadIO m => Iterator -> ByteString -> m ()
+-- | Seek to the given key in the iterator.
+iterSeek ::
+     MonadIO m
+  => Iterator
+  -> ByteString -- ^ Key.
+  -> m ()
 iterSeek iter key =
   withIterPtr
     iter
@@ -509,6 +569,7 @@ iterEntry iter =
            pure ((,) <$> mkey <*> mval)
          else pure Nothing)
 
+-- | Go to the next item in the iterator.
 iterNext :: MonadIO m => Iterator -> m ()
 iterNext iter =
   withIterPtr iter "iterNext" (\iterPtr -> c_rocksdb_iter_next iterPtr)
@@ -529,6 +590,17 @@ withIterPtr iter label f =
               case mfptr of
                 Nothing -> throwIO (IteratorIsClosed label)
                 Just it -> f it)))
+
+-- | Do something with the iterator. This only succeeds if the db
+-- iterator is not released. This function expects a locked database
+-- handle, via @withDBPtr@.
+withSnapshotPtr :: MonadIO m => Ptr CDB -> Snapshot -> String -> (Ptr CSnapshot -> IO a) -> m a
+withSnapshotPtr _ snapshot label f =
+  liftIO
+    (do mfptr <- readIORef (snapshotRef snapshot)
+        case mfptr of
+          Nothing -> throwIO (SnapshotIsClosed label)
+          Just it -> f it)
 
 -- | Do something with the pointer inside. This is thread-safe.
 withDBPtr :: DB -> String -> (Ptr CDB -> IO a) -> IO a
@@ -561,11 +633,22 @@ withWriteOptions WriteOptions =
     (assertNotNull "c_rocksdb_writeoptions_create" c_rocksdb_writeoptions_create)
     c_rocksdb_writeoptions_destroy
 
-withReadOptions :: ReadOptions -> (Ptr CReadOptions -> IO a) -> IO a
-withReadOptions ReadOptions =
+withReadOptions :: Ptr CDB -> ReadOptions -> (Ptr CReadOptions -> IO a) -> IO a
+withReadOptions dbPtr ReadOptions {readOptionsSnapshot = msnapshot} f =
   bracket
     (assertNotNull "c_rocksdb_readoptions_create" c_rocksdb_readoptions_create)
     c_rocksdb_readoptions_destroy
+    (\opts -> do
+       maybe
+         (pure ())
+         (\snapshot ->
+            withSnapshotPtr
+              dbPtr
+              snapshot
+              "withReadOptions"
+              (c_rocksdb_readoptions_set_snapshot opts))
+         msnapshot
+       f opts)
 
 replaceEncoding :: Options -> IO GHC.TextEncoding
 #ifdef mingw32_HOST_OS
@@ -634,6 +717,7 @@ data CWriteBatch
 data CReadOptions
 data CDB
 data CIterator
+data CSnapshot
 
 foreign import ccall safe "rocksdb/c.h rocksdb_options_create"
   c_rocksdb_options_create :: IO (Ptr COptions)
@@ -719,8 +803,19 @@ foreign import ccall safe "rocksdb/c.h rocksdb_delete"
                    -> IO ()
 
 foreign import ccall safe "rocksdb/c.h rocksdb_create_iterator"
-               c_rocksdb_create_iterator ::
-               Ptr CDB -> Ptr CReadOptions -> IO (Ptr CIterator)
+  c_rocksdb_create_iterator ::
+  Ptr CDB -> Ptr CReadOptions -> IO (Ptr CIterator)
+
+foreign import ccall safe "rocksdb/c.h rocksdb_create_snapshot"
+  c_rocksdb_create_snapshot ::
+  Ptr CDB -> IO (Ptr CSnapshot)
+
+foreign import ccall safe "rocksdb/c.h rocksdb_release_snapshot"
+  c_rocksdb_release_snapshot ::
+  Ptr CDB -> Ptr CSnapshot -> IO ()
+
+foreign import ccall safe "rocksdb/c.h rocksdb_readoptions_set_snapshot"
+  c_rocksdb_readoptions_set_snapshot :: Ptr CReadOptions -> Ptr CSnapshot -> IO ()
 
 foreign import ccall safe "rocksdb/c.h rocksdb_iter_destroy"
   c_rocksdb_iter_destroy :: Ptr CIterator -> IO ()
